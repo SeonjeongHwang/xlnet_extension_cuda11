@@ -1,4 +1,7 @@
 # XLNet Extension
+
+for cuda11
+
 **\*\*\*\*\* Top 3 single model on [CoQA](https://stanfordnlp.github.io/coqa/) leaderboard as of Sep 13th, 2019\*\*\*\*\***
 
 **\*\*\*\*\* Top 3 single model on [QuAC](https://quac.ai/) leaderboard as of Nov 1st, 2019\*\*\*\*\***
