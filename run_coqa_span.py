@@ -3,7 +3,7 @@ from __future__ import division
 from __future__ import print_function
 
 import sys
-sys.path.append('xlnet_11') # walkaround due to submodule absolute import...
+sys.path.append('xlnet') # walkaround due to submodule absolute import...
 
 import collections
 import os
@@ -12,30 +12,42 @@ import json
 import pickle
 import time
 import string
-import argparse
+import tqdm
+import math
 
 import tensorflow as tf
 import numpy as np
 import sentencepiece as sp
+from six.moves import xrange
 
 from tool.eval_coqa import CoQAEvaluator
-from xlnet_11 import xlnet
+from xlnet import xlnet
 import function_builder
 import prepro_utils
 import model_utils
+
 
 MAX_FLOAT = 1e30
 MIN_FLOAT = -1e30
 FLAGS = None
 
+import argparse
+
 def parse_args():
     parser = argparse.ArgumentParser('run CoQA question answering task')
-
+    parser.add_argument('--train-original', dest="train_original", action='store_true', help='Whether to train the original coqa dataset')
+    parser.add_argument('--train-original-span', dest="train_original_span", action='store_true', help='Whether to train the original coqa dataset')
+    parser.add_argument('--train-generated-coqa', dest="train_generated_coqa", action='store_true', help='Whether to train the generated coqa dataset')
+    parser.add_argument('--train-generated-quac', dest="train_generated_quac", action='store_true', help='Whether to train the generated quac dataset')
+    
+    parser.add_argument('--fine-tune', dest="fine_tune", action='store_true', help='Whether this training is for fine-tuning')
+    parser.add_argument('--pretrained-steps', dest="pretrained_steps", default=None, type=int, help="the number of steps in the pre-training stage")
+    
     parser.add_argument('--data-dir', dest="data_dir", required=True, default=None, type=str, help='Data directory where raw data located.')
     parser.add_argument('--output-dir', dest="output_dir", required=True, default=None, type=str, help='Output directory where processed data located.')
     parser.add_argument('--model-dir', dest="model_dir", required=True, default=None, type=str, help='Model directory where checkpoints located.')
     parser.add_argument('--export-dir', dest="export_dir", required=True, default=None, type=str, help='Export directory where saved model located.')
-
+    
     parser.add_argument('--task-name', dest="task_name", default=None, type=str, help='The name of the task to train.')
     parser.add_argument('--model-config-path', dest="model_config_path", required=True, default=None, type=str, help='Config file of the pre-trained model.')
     parser.add_argument('--init-checkpoint', dest="init_checkpoint", required=True, default=None, type=str, help='Initial checkpoint of the pre-trained model.')
@@ -43,16 +55,23 @@ def parse_args():
     parser.add_argument('--overwrite-data', dest="overwrite_data", action='store_true', help='If False, will use cached data if available.')
     parser.add_argument('--random-seed', dest="random_seed", type=int, help="Random seed for weight initialzation.")
     parser.add_argument('--predict-tag', dest="predict_tag", default=None, type=str, help='Predict tag for predict result tracking.')
-
+    
     parser.add_argument('--do-train', dest="do_train", action='store_true', help='Whether to run training.')
     parser.add_argument('--do-predict', dest="do_predict", action='store_true', help='Whether to run prediction.')
     parser.add_argument('--do-export', dest="do_export", action='store_true', help='Whether to run exporting.')
-
+    
+    parser.add_argument('--do-predict-span', dest="do_predict_span", action='store_true', help='Whether to run prediction.')
+    parser.add_argument('--do-predict-coqa', dest="do_predict_coqa", action='store_true', help='Whether to run prediction.')
+    parser.add_argument('--do-predict-quac', dest="do_predict_quac", action='store_true', help='Whether to run prediction.')
+    
+    parser.add_argument('--do-predict-coqa-train', dest="do_predict_coqa_train", action='store_true', help='Whether to run prediction.')
+    parser.add_argument('--do-predict-quac-train', dest="do_predict_quac_train", action='store_true', help='Whether to run prediction.')
+    
     parser.add_argument('--init', dest="init", default="normal", type=str, help='Initialization method; [normal, uniform]')
     parser.add_argument('--init-std', dest="init_std", default=0.02, type=str, help='Initialization std when init is normal.')
     parser.add_argument('--init-range', dest="init_range", default=0.1, type=str, help='Initialization std when init is uniform.')
     parser.add_argument('--init-global-vars', dest="init_global_vars", action='store_true', help='If true, init all global vars. If false, init trainable vars only.')
-
+    
     parser.add_argument('--lower-case', dest="lower_case", action='store_true', help='Enable lower case nor not.')
     parser.add_argument('--num-turn', dest="num_turn", default=2, type=int, help='Number of turns')
     parser.add_argument('--doc-stride', dest="doc_stride", default=128, type=int, help='Doc stride')
@@ -61,18 +80,19 @@ def parse_args():
     parser.add_argument('--max-answer-length', dest="max_answer_length", default=16, type=int, help='Max answer length')
     parser.add_argument('--train-batch-size', dest="train_batch_size", default=48, type=int, help='Total batch size for training.')
     parser.add_argument('--predict-batch-size', dest="predict_batch_size", default=32, type=int, help='Total batch size for predict.')
-
+    
+    parser.add_argument('--epochs', dest="epochs", default=2, type=int, help='Number of epochs')
     parser.add_argument('--train-steps', dest="train_steps", default=20000, type=int, help='Number of training steps')
     parser.add_argument('--warmup-steps', dest="warmup_steps", default=0, type=int, help='number of warmup steps')
     parser.add_argument('--max-save', dest="max_save", default=5, type=int, help='Max number of checkpoints to save. Use 0 to save all.')
     parser.add_argument('--save-steps', dest="save_steps", default=1000, type=int, help='Save the model for every save_steps. If None, not to save any model.')
     parser.add_argument('--shuffle-buffer', dest="shuffle_buffer", default=2048, type=int, help='Buffer size used for shuffle.')
-
+    
     parser.add_argument('--n-best-size', dest="n_best_size", default=5, type=int, help='n best size for predictions')
     parser.add_argument('--start-n-top', dest="start_n_top", default=5, type=int, help='Beam size for span start.')
     parser.add_argument('--end-n-top', dest="end_n_top", default=5, type=int, help='Beam size for span end.')
     parser.add_argument('--target-eval_key', dest="target_eval_key", default="best_f1", type=str, help='Use has_ans_f1 for Model I.')
-
+    
     parser.add_argument('--use-bfloat16', dest="use_bfloat16", action='store_true', help='Whether to use bfloat16.')
     parser.add_argument('--dropout', dest="dropout", default=0.1, type=float, help='Dropout rate.')
     parser.add_argument('--dropatt', dest="dropatt", default=0.1, type=float, help='Attention dropout rate.')
@@ -98,7 +118,7 @@ def parse_args():
     parser.add_argument('--iterations', dest="iterations", default=1000, type=int, help='number of iterations per TPU training loop.')
     
     return parser.parse_args()
-
+   
 class InputExample(object):
     """A single CoQA example."""
     def __init__(self,
@@ -118,7 +138,7 @@ class InputExample(object):
         self.answer_type = answer_type
         self.answer_subtype = answer_subtype
         self.is_skipped = is_skipped
-    
+        
     def __str__(self):
         return self.__repr__()
     
@@ -150,12 +170,7 @@ class InputFeatures(object):
                  cls_index,
                  para_length,
                  start_position=None,
-                 end_position=None,
-                 is_unk=None,
-                 is_yes=None,
-                 is_no=None,
-                 number=None,
-                 option=None):
+                 end_position=None):
         self.unique_id = unique_id
         self.qas_id = qas_id
         self.doc_idx = doc_idx
@@ -170,36 +185,31 @@ class InputFeatures(object):
         self.para_length = para_length
         self.start_position = start_position
         self.end_position = end_position
-        self.is_unk = is_unk
-        self.is_yes = is_yes
-        self.is_no = is_no
-        self.number = number
-        self.option = option
 
 class OutputResult(object):
     """A single CoQA result."""
     def __init__(self,
                  unique_id,
-                 unk_prob,
-                 yes_prob,
-                 no_prob,
-                 num_probs,
-                 opt_probs,
                  start_prob,
                  start_index,
                  end_prob,
                  end_index):
         self.unique_id = unique_id
-        self.unk_prob = unk_prob
-        self.yes_prob = yes_prob
-        self.no_prob = no_prob
-        self.num_probs = num_probs
-        self.opt_probs = opt_probs
         self.start_prob = start_prob
         self.start_index = start_index
         self.end_prob = end_prob
         self.end_index = end_index
-
+        
+class OutputLogits(object):
+    """A single CoQA result."""
+    def __init__(self,
+                 unique_id,
+                 start_logits,
+                 end_logits):
+        self.unique_id = unique_id
+        self.start_logits = start_logits
+        self.end_logits = end_logits
+        
 class CoqaPipeline(object):
     """Pipeline for CoQA dataset."""
     def __init__(self,
@@ -225,6 +235,41 @@ class CoqaPipeline(object):
         example_list = self._get_example(data_list)
         return example_list
     
+    def get_dev_span_examples(self):
+        """Gets a collection of `InputExample`s for the dev set."""
+        data_path = os.path.join(self.data_dir, "dev-{0}.json".format(self.task_name))
+        data_list = self._read_json(data_path)
+        example_list = self._get_example(data_list, only_span=True)
+        return example_list
+    
+    def get_g_coqa_examples(self): #### Custom ####
+        """Gets a collection of 'InputExamples's for the train set."""
+        data_path = os.path.join(self.data_dir, "G_CoQA.json")
+        data_list = self._read_generated_data_json(data_path)
+        example_list = self._get_example_from_generated_dataset(data_list)
+        return example_list
+    
+    def get_g_quac_examples(self): #### Custom ####
+        """Gets a collection of 'InputExamples's for the train set."""
+        data_path = os.path.join(self.data_dir, "G_QuAC.json")
+        data_list = self._read_generated_data_json(data_path)
+        example_list = self._get_example_from_generated_dataset(data_list)
+        return example_list
+    
+    def get_g_coqa_dev_examples(self):
+        """Gets a collection of `InputExample`s for the dev set."""
+        data_path = os.path.join(self.data_dir, "G_CoQA_dev.json".format(self.task_name))
+        data_list = self._read_generated_data_json(data_path)
+        example_list = self._get_example_from_generated_dataset(data_list)
+        return example_list
+    
+    def get_g_quac_dev_examples(self):
+        """Gets a collection of `InputExample`s for the dev set."""
+        data_path = os.path.join(self.data_dir, "G_QuAC_dev.json".format(self.task_name))
+        data_list = self._read_generated_data_json(data_path)
+        example_list = self._get_example_from_generated_dataset(data_list)
+        return example_list
+    
     def _read_json(self,
                    data_path):
         if os.path.exists(data_path):
@@ -233,6 +278,15 @@ class CoqaPipeline(object):
                 return data_list
         else:
             raise FileNotFoundError("data path not found: {0}".format(data_path))
+            
+    def _read_generated_data_json(self,
+                                  data_path): #### Custom ####
+        if os.path.exists(data_path):
+            with open(data_path, "r") as file:
+                data_list = json.load(file)
+                return data_list
+        else:
+                raise FileNotFoundError("data path not found: {0}".format(data_path))
     
     def _whitespace_tokenize(self,
                              text):
@@ -307,6 +361,12 @@ class CoqaPipeline(object):
         question_tokens = ['<s>'] + question["input_text"].split(' ')
         return " ".join(history + [" ".join(question_tokens)])
     
+    def _get_question_text_for_generated_dataset(self,
+                                                 history,
+                                                 question):
+        question_tokens = ['<s>'] + question.split(' ')
+        return " ".join(history + [" ".join(question_tokens)])
+    
     def _get_question_history(self,
                               history,
                               question,
@@ -326,6 +386,24 @@ class CoqaPipeline(object):
         if num_turn >= 0 and len(history) > num_turn:
             history = history[-num_turn:]
         
+        return history
+    
+    def _get_question_history_for_generated_dataset(self,
+                                                    history,
+                                                    question,
+                                                    answer,
+                                                    num_turn):  #### Custom ####
+        question_tokens = []
+        question_tokens.extend(['<s>'] + question.split(' '))
+        question_tokens.extend(['</s>'] + answer.split(' '))
+
+        question_text = " ".join(question_tokens)
+        if question_text:
+            history.append(question_text)
+
+        if num_turn >= 0 and len(history) > num_turn:
+            history = history[-num_turn:]
+
         return history
     
     def _find_answer_span(self,
@@ -395,6 +473,23 @@ class CoqaPipeline(object):
         
         return answer_text, span_start, span_end, is_skipped
     
+    def _get_start_position_for_generated_dataset(self,
+                                                  answer_text,
+                                                  span_start,
+                                                  paragraph_text):
+        tolerance = 6
+        candidate_span_start = max(0, span_start-tolerance)
+        start_position = None
+        for start_idx in range(candidate_span_start, len(paragraph_text)-len(answer_text)+1):
+            if paragraph_text[start_idx:start_idx+len(answer_text)] == answer_text:
+                start_position = start_idx
+                break
+                
+        if start_position == None:
+            print(f"{paragraph_text[candidate_span_start:candidate_span_start+len(answer_text)+tolerance]} and {answer_text}")
+        
+        return start_position
+    
     def _normalize_answer(self,
                           answer):
         norm_answer = CoQAEvaluator.normalize_answer(answer)
@@ -421,21 +516,6 @@ class CoqaPipeline(object):
         if norm_answer == "no":
             return "no", None
         
-        if norm_answer in ["none", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]:
-            return "number", norm_answer
-        
-        norm_question_tokens = CoQAEvaluator.normalize_answer(question["input_text"]).split(" ")
-        if "or" in norm_question_tokens:
-            index = norm_question_tokens.index("or")
-            if index-1 >= 0 and index+1 < len(norm_question_tokens):
-                if norm_answer == norm_question_tokens[index-1]:
-                    norm_answer = "option_a"
-                elif norm_answer == norm_question_tokens[index+1]:
-                    norm_answer = "option_b"
-        
-        if norm_answer in ["option_a", "option_b"]:
-            return "option", norm_answer
-        
         return "span", None
     
     def _process_found_answer(self,
@@ -454,7 +534,8 @@ class CoqaPipeline(object):
         return ' '.join(found_answer_tokens)
     
     def _get_example(self,
-                     data_list):
+                     data_list,
+                     only_span=False):
         examples = []
         for data in data_list:
             data_id = data["id"]
@@ -473,12 +554,11 @@ class CoqaPipeline(object):
                 question_text = self._get_question_text(question_history, question)
                 question_history = self._get_question_history(question_history, question, answer, answer_type, is_skipped, self.num_turn)
                 
-                if answer_type not in ["unknown", "yes", "no"] and not is_skipped and answer_text:
-                    start_position = span_start
-                    orig_answer_text = self._process_found_answer(answer["input_text"], answer_text)
-                else:
-                    start_position = -1
-                    orig_answer_text = ""
+                if answer_type in ["unknown", "yes", "no"] or is_skipped:
+                    continue
+                
+                start_position = span_start
+                orig_answer_text = self._process_found_answer(answer["input_text"], answer_text)
                 
                 example = InputExample(
                     qas_id=qas_id,
@@ -492,6 +572,58 @@ class CoqaPipeline(object):
 
                 examples.append(example)
         
+        return examples
+    
+    def _get_example_from_generated_dataset(self,
+                                            data_list):  #### Custom ####
+        examples = []
+        for data in data_list:
+            data_id = data["id"]
+            doc_tokens = data["doc_tokens"]
+            QnA_list = data["QnA"]
+
+            question_history = []
+            for i, qas in enumerate(QnA_list):
+                turn_id = qas["turn_id"]
+                question = qas["question"]
+                answer_text = qas["answer"]["text"]
+                start_token_idx = qas["answer"]["start_token_idx"]
+                end_token_idx = qas["answer"]["end_token_idx"]
+
+                qas_id = "{0}_{1}".format(data_id, i+1)
+
+                paragraph_text = ""
+                start_position = None
+                for idx, token in enumerate(doc_tokens):
+                    if idx == start_token_idx:
+                        if idx == 0:
+                            start_position = 0
+                        else:
+                            start_position = len(paragraph_text)+1
+                    if idx == 0:
+                        paragraph_text += token
+                    else:
+                        paragraph_text += " "+token
+                        
+                start_position = self._get_start_position_for_generated_dataset(answer_text, start_position, paragraph_text)
+
+                if paragraph_text[start_position:start_position+len(answer_text)] != answer_text:
+                    print(f"'{paragraph_text[start_position:start_position+len(answer_text)]}' != '{answer_text}'")
+
+                question_text = self._get_question_text_for_generated_dataset(question_history, question)
+                question_history = self._get_question_history_for_generated_dataset(question_history, question, answer_text, self.num_turn)
+
+                example = InputExample(
+                    qas_id=qas_id,
+                    question_text=question_text,
+                    paragraph_text=paragraph_text,
+                    orig_answer_text=answer_text,
+                    start_position=start_position,
+                    answer_type="span",
+                    answer_subtype=None,
+                    is_skipped=False)
+
+                examples.append(example)
         return examples
 
 class XLNetTokenizer(object):
@@ -895,21 +1027,6 @@ class XLNetExampleProcessor(object):
             
             start_position = None
             end_position = None
-            is_unk = (example.answer_type == "unknown" or example.is_skipped)
-            is_yes = (example.answer_type == "yes")
-            is_no = (example.answer_type == "no")
-            
-            if example.answer_type == "number":
-                number_list = ["none", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
-                number = number_list.index(example.answer_subtype) + 1
-            else:
-                number = 0
-            
-            if example.answer_type == "option":
-                option_list = ["option_a", "option_b"]
-                option = option_list.index(example.answer_subtype) + 1
-            else:
-                option = 0
             
             if example.answer_type not in ["unknown", "yes", "no"] and not example.is_skipped and example.orig_answer_text:
                 doc_start = doc_span["start"]
@@ -920,7 +1037,6 @@ class XLNetExampleProcessor(object):
                 else:
                     start_position = cls_index
                     end_position = cls_index
-                    is_unk = True
             else:
                 start_position = cls_index
                 end_position = cls_index
@@ -966,12 +1082,7 @@ class XLNetExampleProcessor(object):
                 cls_index=cls_index,
                 para_length=doc_para_length,
                 start_position=start_position,
-                end_position=end_position,
-                is_unk=is_unk,
-                is_yes=is_yes,
-                is_no=is_no,
-                number=number,
-                option=option)
+                end_position=end_position)
             
             feature_list.append(feature)
             self.unique_id += 1
@@ -982,11 +1093,8 @@ class XLNetExampleProcessor(object):
                                      examples):
         """Convert a set of `InputExample`s to a list of `InputFeatures`."""
         features = []
-        for (idx, example) in enumerate(examples):
-            if idx % 1000 == 0:
-                tf.logging.info("Converting example %d of %d" % (idx, len(examples)))
-
-            feature_list = self.convert_coqa_example(example, logging=(idx < 20))
+        for (idx, example) in tqdm.tqdm(enumerate(examples), total=len(examples)):
+            feature_list = self.convert_coqa_example(example, logging=False)
             features.extend(feature_list)
         
         tf.compat.v1.logging.info("Generate %d features from %d examples" % (len(features), len(examples)))
@@ -1015,11 +1123,6 @@ class XLNetExampleProcessor(object):
                 
                 features["start_position"] = create_int_feature([feature.start_position])
                 features["end_position"] = create_int_feature([feature.end_position])
-                features["is_unk"] = create_float_feature([1 if feature.is_unk else 0])
-                features["is_yes"] = create_float_feature([1 if feature.is_yes else 0])
-                features["is_no"] = create_float_feature([1 if feature.is_no else 0])
-                features["number"] = create_float_feature([feature.number])
-                features["option"] = create_float_feature([feature.option])
                 
                 tf_example = tf.train.Example(features=tf.train.Features(feature=features))
                 writer.write(tf_example.SerializeToString())
@@ -1062,12 +1165,7 @@ class XLNetInputBuilder(object):
         
         if is_training:
             name_to_features["start_position"] = tf.io.FixedLenFeature([], tf.int64)
-            name_to_features["end_position"] = tf.io.FixedLenFeature([], tf.int64)
-            name_to_features["is_unk"] = tf.io.FixedLenFeature([], tf.float32)
-            name_to_features["is_yes"] = tf.io.FixedLenFeature([], tf.float32)
-            name_to_features["is_no"] = tf.io.FixedLenFeature([], tf.float32)
-            name_to_features["number"] = tf.io.FixedLenFeature([], tf.float32)
-            name_to_features["option"] = tf.io.FixedLenFeature([], tf.float32)
+            name_to_features["end_position"] = tf.io.FixedLenFeature([], tf.int64)             
         
         def _decode_record(record,
                            name_to_features):
@@ -1155,10 +1253,10 @@ class XLNetModelBuilder(object):
         masked_label = tf.cast(label, dtype=tf.int32) * tf.cast(label_mask, dtype=tf.int32)
                 
         if label_smoothing > 1e-10:
-            onehot_label = self._generate_onehot_label(masked_label, tf.shape(masked_predict)[-1])
+            onehot_label = self._generate_onehot_label(masked_label, tf.shape(input=masked_predict)[-1])
             onehot_label = (onehot_label * (1 - label_smoothing) +
-                label_smoothing / tf.cast(tf.shape(masked_predict)[-1], dtype=tf.float32)) * predict_mask
-            loss = tf.nn.softmax_cross_entropy_with_logits_v2(labels=onehot_label, logits=masked_predict)
+                label_smoothing / tf.cast(tf.shape(input=masked_predict)[-1], dtype=tf.float32)) * predict_mask
+            loss = tf.nn.softmax_cross_entropy_with_logits(labels=onehot_label, logits=masked_predict)
         else:
             loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=masked_label, logits=masked_predict)
         
@@ -1172,23 +1270,18 @@ class XLNetModelBuilder(object):
                       segment_ids,
                       cls_index,
                       start_positions=None,
-                      end_positions=None,
-                      is_unk=None,
-                      is_yes=None,
-                      is_no=None,
-                      number=None,
-                      option=None):
+                      end_positions=None):
         """Creates XLNet-CoQA model"""
         model = xlnet.XLNetModel(
             xlnet_config=self.model_config,
             run_config=xlnet.create_run_config(is_training, True, FLAGS),
-            input_ids=tf.transpose(input_ids, perm=[1,0]),                                                               # [b,l] --> [l,b]
-            input_mask=tf.transpose(input_mask, perm=[1,0]),                                                             # [b,l] --> [l,b]
-            seg_ids=tf.transpose(segment_ids, perm=[1,0]))                                                               # [b,l] --> [l,b]
+            input_ids=tf.transpose(a=input_ids, perm=[1,0]),                                                               # [b,l] --> [l,b]
+            input_mask=tf.transpose(a=input_mask, perm=[1,0]),                                                             # [b,l] --> [l,b]
+            seg_ids=tf.transpose(a=segment_ids, perm=[1,0]))                                                               # [b,l] --> [l,b]
         
         initializer = model.get_initializer()
-        seq_len = tf.shape(input_ids)[-1]
-        output_result = tf.transpose(model.get_sequence_output(), perm=[1,0,2])                                      # [l,b,h] --> [b,l,h]
+        seq_len = tf.shape(input=input_ids)[-1]
+        output_result = tf.transpose(a=model.get_sequence_output(), perm=[1,0,2])                                      # [l,b,h] --> [b,l,h]
         
         predicts = {}
         with tf.compat.v1.variable_scope("mrc", reuse=tf.compat.v1.AUTO_REUSE):
@@ -1203,11 +1296,11 @@ class XLNetModelBuilder(object):
                 start_result = tf.squeeze(start_result, axis=-1)                                                       # [b,l,1] --> [b,l]
                 start_result = self._generate_masked_data(start_result, start_result_mask)                        # [b,l], [b,l] --> [b,l]
                 start_prob = tf.nn.softmax(start_result, axis=-1)                                                                  # [b,l]
-                
+                                
                 if not is_training:
                     start_top_prob, start_top_index = tf.nn.top_k(start_prob, k=FLAGS.start_n_top)                # [b,l] --> [b,k], [b,k]
                     predicts["start_prob"] = start_top_prob
-                    predicts["start_index"] = start_top_index
+                    predicts["start_index"] = start_top_index                    
             
             with tf.compat.v1.variable_scope("end", reuse=tf.compat.v1.AUTO_REUSE):
                 if is_training:
@@ -1220,11 +1313,11 @@ class XLNetModelBuilder(object):
                     end_result_mask = 1 - p_mask                                                                                   # [b,l]
                     
                     end_result = tf.compat.v1.layers.dense(end_result, units=self.model_config.d_model, activation=tf.tanh,
-                        use_bias=True, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
+                        use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
                         kernel_regularizer=None, bias_regularizer=None, trainable=True, name="end_modeling")        # [b,l,2h] --> [b,l,h]
                     
                     end_result = tf.keras.layers.LayerNormalization(epsilon=1e-12, center=True, scale=True, 
-                                                                    trainable=True, name="end_norm")(end_result)      # [b,l,h] --> [b,l,h]
+                                                                    trainable=True, name="end_norm")(end_result)     # [b,l,h] --> [b,l,h]
                     
                     end_result = tf.compat.v1.layers.dense(end_result, units=1, activation=None,
                         use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
@@ -1233,6 +1326,7 @@ class XLNetModelBuilder(object):
                     end_result = tf.squeeze(end_result, axis=-1)                                                       # [b,l,1] --> [b,l]
                     end_result = self._generate_masked_data(end_result, end_result_mask)                          # [b,l], [b,l] --> [b,l]
                     end_prob = tf.nn.softmax(end_result, axis=-1)                                                                  # [b,l]
+                    
                 else:
                     # During inference, compute the end logits based on beam search
                     start_index = self._generate_onehot_label(start_top_index, seq_len)                                # [b,k] --> [b,k,l]
@@ -1251,124 +1345,31 @@ class XLNetModelBuilder(object):
                         kernel_regularizer=None, bias_regularizer=None, trainable=True, name="end_modeling")    # [b,l,k,2h] --> [b,l,k,h]
                     
                     end_result = tf.keras.layers.LayerNormalization(epsilon=1e-12, center=True, scale=True, 
-                                                                  trainable=True, name="end_norm")(end_result)  # [b,l,k,h] --> [b,l,k,h]
+                                                                  trainable=True, name="end_norm")(end_result)   # [b,l,k,h] --> [b,l,k,h]
                     
                     end_result = tf.compat.v1.layers.dense(end_result, units=1, activation=None,
                         use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
                         kernel_regularizer=None, bias_regularizer=None, trainable=True, name="end_project")      # [b,l,k,h] --> [b,l,k,1]
                     
-                    end_result = tf.transpose(tf.squeeze(end_result, axis=-1), perm=[0,2,1])                       # [b,l,k,1] --> [b,k,l]
+                    end_result = tf.transpose(a=tf.squeeze(end_result, axis=-1), perm=[0,2,1])                       # [b,l,k,1] --> [b,k,l]
                     end_result = self._generate_masked_data(end_result, end_result_mask)                    # [b,k,l], [b,k,l] --> [b,k,l]
                     end_prob = tf.nn.softmax(end_result, axis=-1)                                                                # [b,k,l]
                     
                     end_top_prob, end_top_index = tf.nn.top_k(end_prob, k=FLAGS.end_n_top)                  # [b,k,l] --> [b,k,k], [b,k,k]
                     predicts["end_prob"] = end_top_prob
-                    predicts["end_index"] = end_top_index
-            
-            with tf.compat.v1.variable_scope("answer", reuse=tf.compat.v1.AUTO_REUSE):
-                answer_cls_index = self._generate_onehot_label(tf.expand_dims(cls_index, axis=-1), seq_len)              # [b] --> [b,1,l]
-                answer_feat_result = tf.matmul(tf.expand_dims(start_prob, axis=1), output_result)             # [b,l], [b,l,h] --> [b,1,h]
-                answer_output_result = tf.matmul(answer_cls_index, output_result)                           # [b,1,l], [b,l,h] --> [b,1,h]
-                
-                answer_result = tf.concat([answer_feat_result, answer_output_result], axis=-1)             # [b,1,h], [b,1,h] --> [b,1,2h]
-                answer_result = tf.squeeze(answer_result, axis=1)                                                    # [b,1,2h] --> [b,2h]
-                
-                answer_result = tf.compat.v1.layers.dense(answer_result, units=self.model_config.d_model, activation=tf.tanh,
-                    use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
-                    kernel_regularizer=None, bias_regularizer=None, trainable=True, name="answer_modeling")             # [b,2h] --> [b,h]
-                
-                answer_result = tf.compat.v1.layers.dropout(answer_result,
-                    rate=FLAGS.dropout, seed=np.random.randint(10000), training=is_training)                             # [b,h] --> [b,h]
-                
-                with tf.compat.v1.variable_scope("unk", reuse=tf.compat.v1.AUTO_REUSE):
-                    unk_result = tf.compat.v1.layers.dense(answer_result, units=1, activation=None,
-                        use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
-                        kernel_regularizer=None, bias_regularizer=None, trainable=True, name="unk_project")              # [b,h] --> [b,1]
-                    unk_result_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                   # [b,l] --> [b]
-                    
-                    unk_result = tf.squeeze(unk_result, axis=-1)                                                           # [b,1] --> [b]
-                    unk_result = self._generate_masked_data(unk_result, unk_result_mask)                                # [b], [b] --> [b]
-                    unk_prob = tf.sigmoid(unk_result)                                                                                # [b]
-                    predicts["unk_prob"] = unk_prob
-                
-                with tf.compat.v1.variable_scope("yes", reuse=tf.compat.v1.AUTO_REUSE):
-                    yes_result = tf.compat.v1.layers.dense(answer_result, units=1, activation=None,
-                        use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
-                        kernel_regularizer=None, bias_regularizer=None, trainable=True, name="yes_project")              # [b,h] --> [b,1]
-                    yes_result_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                   # [b,l] --> [b]
-                    
-                    yes_result = tf.squeeze(yes_result, axis=-1)                                                           # [b,1] --> [b]
-                    yes_result = self._generate_masked_data(yes_result, yes_result_mask)                                # [b], [b] --> [b]
-                    yes_prob = tf.sigmoid(yes_result)                                                                                # [b]
-                    predicts["yes_prob"] = yes_prob
-                
-                with tf.compat.v1.variable_scope("no", reuse=tf.compat.v1.AUTO_REUSE):
-                    no_result = tf.compat.v1.layers.dense(answer_result, units=1, activation=None,
-                        use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
-                        kernel_regularizer=None, bias_regularizer=None, trainable=True, name="no_project")               # [b,h] --> [b,1]
-                    no_result_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
-                    
-                    no_result = tf.squeeze(no_result, axis=-1)                                                             # [b,1] --> [b]
-                    no_result = self._generate_masked_data(no_result, no_result_mask)                                   # [b], [b] --> [b]
-                    no_prob = tf.sigmoid(no_result)                                                                                  # [b]
-                    predicts["no_prob"] = no_prob
-                
-                with tf.compat.v1.variable_scope("num", reuse=tf.compat.v1.AUTO_REUSE):
-                    num_result = tf.compat.v1.layers.dense(answer_result, units=12, activation=None,
-                        use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
-                        kernel_regularizer=None, bias_regularizer=None, trainable=True, name="num_project")             # [b,h] --> [b,12]
-                    num_result_mask = tf.reduce_max(1 - p_mask, axis=-1, keepdims=True)                                  # [b,l] --> [b,1]
-                    
-                    num_result = self._generate_masked_data(num_result, num_result_mask)                        # [b,12], [b,1] --> [b,12]
-                    num_probs = tf.nn.softmax(num_result, axis=-1)                                                                # [b,12]
-                    predicts["num_probs"] = num_probs
-                
-                with tf.compat.v1.variable_scope("opt", reuse=tf.compat.v1.AUTO_REUSE):
-                    opt_result = tf.compat.v1.layers.dense(answer_result, units=3, activation=None,
-                        use_bias=True, kernel_initializer=initializer, bias_initializer=tf.compat.v1.zeros_initializer,
-                        kernel_regularizer=None, bias_regularizer=None, trainable=True, name="opt_project")              # [b,h] --> [b,3]
-                    opt_result_mask = tf.reduce_max(1 - p_mask, axis=-1, keepdims=True)                                  # [b,l] --> [b,1]
-                    
-                    opt_result = self._generate_masked_data(opt_result, opt_result_mask)                          # [b,3], [b,1] --> [b,3]
-                    opt_probs = tf.nn.softmax(opt_result, axis=-1)                                                                 # [b,3]
-                    predicts["opt_probs"] = opt_probs
+                    predicts["end_index"] = end_top_index                   
             
             with tf.compat.v1.variable_scope("loss", reuse=tf.compat.v1.AUTO_REUSE):
                 loss = tf.constant(0.0, dtype=tf.float32)
                 if is_training:
                     start_label = start_positions                                                                                    # [b]
-                    start_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                  # [b,l] --> [b]
+                    start_label_mask = tf.reduce_max(input_tensor=1 - p_mask, axis=-1)                                                  # [b,l] --> [b]
                     start_loss = self._compute_loss(start_label, start_label_mask, start_result, start_result_mask)                  # [b]
                     end_label = end_positions                                                                                        # [b]
-                    end_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
+                    end_label_mask = tf.reduce_max(input_tensor=1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
                     end_loss = self._compute_loss(end_label, end_label_mask, end_result, end_result_mask)                            # [b]
-                    loss += tf.reduce_mean(start_loss + end_loss)
-                    
-                    unk_label = is_unk                                                                                               # [b]
-                    unk_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
-                    unk_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=unk_label * unk_label_mask, logits=unk_result)         # [b]
-                    loss += tf.reduce_mean(unk_loss)
-                    
-                    yes_label = is_yes                                                                                               # [b]
-                    yes_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
-                    yes_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=yes_label * yes_label_mask, logits=yes_result)         # [b]
-                    loss += tf.reduce_mean(yes_loss)
-                    
-                    no_label = is_no                                                                                                 # [b]
-                    no_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                     # [b,l] --> [b]
-                    no_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=no_label * no_label_mask, logits=no_result)             # [b]
-                    loss += tf.reduce_mean(no_loss)
-                    
-                    num_label = number                                                                                               # [b]
-                    num_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
-                    num_loss = self._compute_loss(num_label, num_label_mask, num_result, num_result_mask)                            # [b]
-                    loss += tf.reduce_mean(num_loss)
-                    
-                    opt_label = option                                                                                               # [b]
-                    opt_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
-                    opt_loss = self._compute_loss(opt_label, opt_label_mask, opt_result, opt_result_mask)                            # [b]
-                    loss += tf.reduce_mean(opt_loss)
-        
+                    loss += tf.reduce_mean(input_tensor=start_loss + end_loss)
+            
         return loss, predicts
     
     def get_model_fn(self):
@@ -1394,23 +1395,14 @@ class XLNetModelBuilder(object):
             if is_training:
                 start_position = features["start_position"]
                 end_position = features["end_position"]
-                is_unk = features["is_unk"]
-                is_yes = features["is_yes"]
-                is_no = features["is_no"]
-                number = features["number"]
-                option = features["option"]
+                    
             else:
                 start_position = None
                 end_position = None
-                is_unk = None
-                is_yes = None
-                is_no = None
-                number = None
-                option = None
             
             loss, predicts = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, cls_index,
-                start_position, end_position, is_unk, is_yes, is_no, number, option)
-            
+                start_position, end_position)
+                
             scaffold_fn = model_utils.init_from_checkpoint(FLAGS)
             
             output_spec = None
@@ -1422,20 +1414,17 @@ class XLNetModelBuilder(object):
                     train_op=train_op,
                     scaffold_fn=scaffold_fn)
             else:
+                predictions={
+                    "unique_id": unique_id,
+                    "start_prob": predicts["start_prob"],
+                    "start_index": predicts["start_index"],
+                    "end_prob": predicts["end_prob"],
+                    "end_index": predicts["end_index"]
+                    }
+                    
                 output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
                     mode=mode,
-                    predictions={
-                        "unique_id": unique_id,
-                        "unk_prob": predicts["unk_prob"],
-                        "yes_prob": predicts["yes_prob"],
-                        "no_prob": predicts["no_prob"],
-                        "num_probs": predicts["num_probs"],
-                        "opt_probs": predicts["opt_probs"],
-                        "start_prob": predicts["start_prob"],
-                        "start_index": predicts["start_index"],
-                        "end_prob": predicts["end_prob"],
-                        "end_index": predicts["end_index"]
-                    },
+                    predictions=predictions,
                     scaffold_fn=scaffold_fn)
             
             return output_spec
@@ -1451,15 +1440,19 @@ class XLNetPredictProcessor(object):
                  end_n_top,
                  max_answer_length,
                  tokenizer,
-                 predict_tag=None):
+                 predict_tag=None,
+                 for_train=False):
         """Construct XLNet predict processor"""
         self.n_best_size = n_best_size
         self.start_n_top = start_n_top
         self.end_n_top = end_n_top
         self.max_answer_length = max_answer_length
         self.tokenizer = tokenizer
+        self.for_train = for_train
         
         predict_tag = predict_tag if predict_tag else str(time.time())
+        if self.for_train:
+            pass
         self.output_summary = os.path.join(output_dir, "predict.{0}.summary.json".format(predict_tag))
         self.output_detail = os.path.join(output_dir, "predict.{0}.detail.json".format(predict_tag))
     
@@ -1512,16 +1505,6 @@ class XLNetPredictProcessor(object):
                 tf.compat.v1.logging.warning('No feature found for example: {0}'.format(example.qas_id))
                 continue
             
-            example_unk_score = MAX_FLOAT
-            example_yes_score = MIN_FLOAT
-            example_no_score = MIN_FLOAT
-            example_num_id = 0
-            example_num_score = MIN_FLOAT
-            example_num_probs = None
-            example_opt_id = 0
-            example_opt_score = MIN_FLOAT
-            example_opt_probs = None
-            
             example_all_predicts = []
             example_features = qas_id_to_features[example.qas_id]
             for example_feature in example_features:
@@ -1530,25 +1513,6 @@ class XLNetPredictProcessor(object):
                     continue
                 
                 example_result = unique_id_to_result[example_feature.unique_id]
-                example_unk_score = min(example_unk_score, float(example_result.unk_prob))
-                example_yes_score = max(example_yes_score, float(example_result.yes_prob))
-                example_no_score = max(example_no_score, float(example_result.no_prob))
-                
-                num_probs = [float(num_prob) for num_prob in example_result.num_probs]
-                num_id = int(np.argmax(num_probs[1:])) + 1
-                num_score = num_probs[num_id]
-                if example_num_score < num_score:
-                    example_num_id = num_id
-                    example_num_score = num_score
-                    example_num_probs = num_probs
-                
-                opt_probs = [float(opt_prob) for opt_prob in example_result.opt_probs]
-                opt_id = int(np.argmax(opt_probs[1:])) + 1
-                opt_score = opt_probs[opt_id]
-                if example_opt_score < opt_score:
-                    example_opt_id = opt_id
-                    example_opt_score = opt_score
-                    example_opt_probs = opt_probs
                 
                 for i in range(self.start_n_top):
                     start_prob = example_result.start_prob[i]
@@ -1604,7 +1568,7 @@ class XLNetPredictProcessor(object):
                 example_top_predicts.append({
                     "predict_text": "",
                     "predict_score": 0.0
-                })
+                })           
             
             example_best_predict = example_top_predicts[0]
             
@@ -1614,15 +1578,6 @@ class XLNetPredictProcessor(object):
                 "qas_id": example.qas_id,
                 "question_text": example_question_text,
                 "label_text": example.orig_answer_text,
-                "unk_score": example_unk_score,
-                "yes_score": example_yes_score,
-                "no_score": example_no_score,
-                "num_id": example_num_id,
-                "num_score": example_num_score,
-                "num_probs": example_num_probs,
-                "opt_id": example_opt_id,
-                "opt_score": example_opt_score,
-                "opt_probs": example_opt_probs,
                 "predict_text": example_best_predict["predict_text"],
                 "predict_score": example_best_predict["predict_score"]
             })
@@ -1631,22 +1586,12 @@ class XLNetPredictProcessor(object):
                 "qas_id": example.qas_id,
                 "question_text": example_question_text,
                 "label_text": example.orig_answer_text,
-                "unk_score": example_unk_score,
-                "yes_score": example_yes_score,
-                "no_score": example_no_score,
-                "num_id": example_num_id,
-                "num_score": example_num_score,
-                "num_probs": example_num_probs,
-                "opt_id": example_opt_id,
-                "opt_score": example_opt_score,
-                "opt_probs": example_opt_probs,
                 "best_predict": example_best_predict,
                 "top_predicts": example_top_predicts
             })
-        
         self._write_to_json(predict_summary_list, self.output_summary)
         self._write_to_json(predict_detail_list, self.output_detail)
-
+        
 def main(_):
     tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
     
@@ -1690,55 +1635,234 @@ def main(_):
         doc_stride=FLAGS.doc_stride,
         tokenizer=tokenizer)
     
+    def write_meta_file(example_num, feature_num, file_name):
+        data = {"num of examples": example_num, "num of features": feature_num}
+        with open(file_name, "w") as writer:
+            json.dump(data, writer, indent=4)
+            
+    def get_num_of_features(file_name):
+        with open(file_name, "r") as reader:
+            data = json.load(reader)
+        return data["num of features"]
+    
     if FLAGS.do_train:
-        train_examples = data_pipeline.get_train_examples()
-        
+        train_examples = []
+        train_examples_from_g_coqa = []
+        train_examples_from_g_quac = []
         tf.compat.v1.logging.info("***** Run training *****")
-        tf.compat.v1.logging.info("  Num examples = %d", len(train_examples))
-        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+        
+        if FLAGS.train_original_span:
+            train_examples.extend(data_pipeline.get_train_examples())
+        if FLAGS.train_generated_coqa:
+            train_examples_from_g_coqa.extend(data_pipeline.get_g_coqa_examples())
+        if FLAGS.train_generated_quac:
+            train_examples_from_g_quac.extend(data_pipeline.get_g_quac_examples())
+            
+        train_record_file = None
+        train_meta = None
+        if FLAGS.train_original_span:
+            print("Generate original span feature file...")
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}_original_span.tfrecord".format(task_name))
+            train_meta = os.path.join(FLAGS.output_dir, "train-{0}_original_span.meta".format(task_name))
+            if not os.path.exists(train_record_file):
+                original_train_features = example_processor.convert_examples_to_features(train_examples)
+                np.random.shuffle(original_train_features)
+                example_processor.save_features_as_tfrecord(original_train_features, train_record_file)
+                write_meta_file(len(train_examples), len(original_train_features), train_meta)
+        
+        elif FLAGS.train_original and FLAGS.train_generated_coqa and FLAGS.train_generated_quac:
+            original_record_file = os.path.join(FLAGS.output_dir, "train-{0}_original.tfrecord".format(task_name))
+            original_meta = os.path.join(FLAGS.output_dir, "train-{0}_original.meta".format(task_name))
+            
+            generated_coqa_record_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa.tfrecord".format(task_name))
+            generated_coqa_meta = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa.meta".format(task_name))
+            
+            generated_quac_record_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_quac.tfrecord".format(task_name))
+            generated_quac_meta = os.path.join(FLAGS.output_dir, "train-{0}_generated_quac.meta".format(task_name))
+            
+            merged_coqa_record_file = os.path.join(FLAGS.output_dir, "train-{0}_merged_coqa.tfrecord".format(task_name))
+            merged_coqa_meta = os.path.join(FLAGS.output_dir, "train-{0}_merged_coqa.meta".format(task_name))
+            
+            merged_quac_record_file = os.path.join(FLAGS.output_dir, "train-{0}_merged_quac.tfrecord".format(task_name))
+            merged_quac_meta = os.path.join(FLAGS.output_dir, "train-{0}_merged_quac.meta".format(task_name))
+            
+            generated_coqa_quac_record_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa_quac.tfrecord".format(task_name))
+            generated_coqa_quac_meta = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa_quac.meta".format(task_name))
+            
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}_merged_coqa_quac.tfrecord".format(task_name))
+            train_meta = os.path.join(FLAGS.output_dir, "train-{0}_merged_coqa_quac.meta".format(task_name))
+            if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+                original_train_features = None
+                generated_coqa_train_features = None
+                generated_quac_train_features = None
+                if not os.path.exists(original_record_file):
+                    original_train_features = example_processor.convert_examples_to_features(train_examples)
+                    np.random.shuffle(original_train_features)
+                    example_processor.save_features_as_tfrecord(original_train_features, original_record_file)
+                    write_meta_file(len(train_examples), len(original_train_features), original_meta)
+                
+                if not os.path.exists(generated_coqa_record_file):
+                    generated_coqa_train_features = example_processor.convert_examples_to_features(train_examples_from_g_coqa)
+                    np.random.shuffle(generated_coqa_train_features)
+                    example_processor.save_features_as_tfrecord(generated_coqa_train_features, generated_coqa_record_file)
+                    write_meta_file(len(train_examples_from_g_coqa), len(generated_coqa_train_features), generated_coqa_meta)
+                
+                if not os.path.exists(generated_quac_record_file):
+                    generated_quac_train_features = example_processor.convert_examples_to_features(train_examples_from_g_quac)
+                    np.random.shuffle(generated_quac_train_features)
+                    example_processor.save_features_as_tfrecord(generated_quac_train_features, generated_quac_record_file)
+                    write_meta_file(len(train_examples_from_g_quac), len(generated_quac_train_features), generated_quac_meta)
+                
+                if not os.path.exists(merged_coqa_record_file):
+                    merged_coqa_features = original_train_features + generated_coqa_train_features
+                    np.random.shuffle(merged_coqa_features)
+                    example_processor.save_features_as_tfrecord(merged_coqa_features, merged_coqa_record_file)
+                    write_meta_file(len(train_examples)+len(train_examples_from_g_coqa), len(merged_coqa_features), merged_coqa_meta)
+                    
+                if not os.path.exists(merged_quac_record_file):
+                    merged_quac_features = original_train_features + generated_quac_train_features
+                    np.random.shuffle(merged_quac_features)
+                    example_processor.save_features_as_tfrecord(merged_quac_features, merged_quac_record_file)
+                    write_meta_file(len(train_examples)+len(train_examples_from_g_quac), len(merged_quac_features), merged_quac_meta)
+                    
+                if not os.path.exists(generated_coqa_quac_record_file):
+                    generated_coqa_quac_features = generated_coqa_train_features + generated_quac_train_features
+                    np.random.shuffle(generated_coqa_quac_features)
+                    example_processor.save_features_as_tfrecord(generated_coqa_quac_features, generated_coqa_quac_record_file)
+                    write_meta_file(len(train_examples_from_g_coqa)+len(train_examples_from_g_quac), len(generated_coqa_quac_features), generated_coqa_quac_meta)
+                
+                train_features = original_train_features + generated_coqa_train_features + generated_quac_train_features
+                np.random.shuffle(train_features)
+                example_processor.save_features_as_tfrecord(train_features, train_record_file)
+                write_meta_file(len(train_examples)+len(train_examples_from_g_coqa)+len(train_examples_from_g_quac), len(train_features), train_meta)
+                
+        elif FLAGS.train_original and FLAGS.train_generated_coqa:
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}_merged_coqa.tfrecord".format(task_name))
+            train_meta = os.path.join(FLAGS.output_dir, "train-{0}_merged_coqa.meta".format(task_name))
+            if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+                tf.compat.v1.logging.info("NO GENERATED FILES...!!!!")
+                assert 1==0
+                
+        elif FLAGS.train_original and FLAGS.train_generated_quac:
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}_merged_quac.tfrecord".format(task_name))
+            train_meta = os.path.join(FLAGS.output_dir, "train-{0}_merged_quac.meta".format(task_name))
+            if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+                tf.compat.v1.logging.info("NO GENERATED FILES...!!!!")
+                assert 1==0
+
+        elif FLAGS.train_generated_coqa and FLAGS.train_generated_quac:
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa_quac.tfrecord".format(task_name))
+            train_meta = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa_quac.meta".format(task_name))
+            if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+                tf.compat.v1.logging.info("NO GENERATED FILES...!!!!")
+                assert 1==0
+
+        elif FLAGS.train_original:
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}_original.tfrecord".format(task_name))
+            train_meta = os.path.join(FLAGS.output_dir, "train-{0}_original.meta".format(task_name))
+            if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+                tf.compat.v1.logging.info("NO GENERATED FILES...!!!!")
+                assert 1==0
+                
+        elif FLAGS.train_generated_coqa:
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa.tfrecord".format(task_name))
+            train_meta = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa.meta".format(task_name))
+            if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+                tf.compat.v1.logging.info("NO GENERATED FILES...!!!!")
+                assert 1==0
+                
+        elif FLAGS.train_generated_quac:
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_quac.tfrecord".format(task_name))
+            train_meta = os.path.join(FLAGS.output_dir, "train-{0}_generated_quac.meta".format(task_name))
+            if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+                tf.compat.v1.logging.info("NO GENERATED FILES...!!!!")
+                assert 1==0
+                
+        else:
+            assert False, "Select a train dataset"
+            
+        num_of_features = get_num_of_features(train_meta)
+        FLAGS.train_steps = math.ceil((num_of_features * FLAGS.epochs)/(FLAGS.train_batch_size * FLAGS.num_core_per_host))
+        if FLAGS.fine_tune:
+            assert FLAGS.pretrained_steps is not None, "The numbert pretrained steps is required"
+            FLAGS.train_steps += FLAGS.pretrained_steps
+                
+        tf.compat.v1.logging.info("  Num examples from original CoQA dataset = %d", len(train_examples))
+        tf.compat.v1.logging.info("  Num examples from generated CoQA dataset = %d", len(train_examples_from_g_coqa))
+        tf.compat.v1.logging.info("  Num examples from generated QuAC dataset = %d", len(train_examples_from_g_quac))
+        tf.compat.v1.logging.info("  Num total examples = %d", len(train_examples)+len(train_examples_from_g_coqa)+len(train_examples_from_g_quac))
+        tf.compat.v1.logging.info("  Num total features = %d", num_of_features)
+        tf.compat.v1.logging.info("  Batch size per GPU = %d", FLAGS.train_batch_size)
+        tf.compat.v1.logging.info("  Total batch size = %d", FLAGS.train_batch_size * FLAGS.num_core_per_host)
+        tf.compat.v1.logging.info("  Num epochs = %d", FLAGS.epochs)
         tf.compat.v1.logging.info("  Num steps = %d", FLAGS.train_steps)
         
-        train_record_file = os.path.join(FLAGS.output_dir, "train-{0}.tfrecord".format(task_name))
-        if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
-            train_features = example_processor.convert_examples_to_features(train_examples)
-            np.random.shuffle(train_features)
-            example_processor.save_features_as_tfrecord(train_features, train_record_file)
-        
         train_input_fn = XLNetInputBuilder.get_input_fn(train_record_file, FLAGS.max_seq_length, True, True, FLAGS.shuffle_buffer)
-        estimator.train(input_fn=train_input_fn, max_steps=FLAGS.train_steps)
-    
+        estimator.train(input_fn=train_input_fn, max_steps=FLAGS.train_steps)     
+
     if FLAGS.do_predict:
-        predict_examples = data_pipeline.get_dev_examples()
+        predict_examples = None
+        if FLAGS.do_predict_span:
+            tf.compat.v1.logging.info("***** Run the generated CoQA (only span) prediction *****")
+            predict_examples = data_pipeline.get_dev_span_examples()
+        elif FLAGS.do_predict_coqa:
+            tf.compat.v1.logging.info("***** Run the generated CoQA prediction *****")
+            predict_examples = data_pipeline.get_g_coqa_dev_examples()
+        elif FLAGS.do_predict_quac:
+            tf.compat.v1.logging.info("***** Run the generated QuAC prediction *****")
+            predict_examples = data_pipeline.get_g_quac_dev_examples()
+        elif FLAGS.do_predict_coqa_train:
+            tf.compat.v1.logging.info("***** Run the generated CoQA training set prediction *****")
+            predict_examples = data_pipeline.get_g_coqa_examples()
+        elif FLAGS.do_predict_quac_train:
+            tf.compat.v1.logging.info("***** Run the generated QuAC training set prediction *****")
+            predict_examples = data_pipeline.get_g_quac_examples()
+        else:
+            ("***** Run CoQA prediction *****")
+            predict_examples = data_pipeline.get_dev_examples()
         
-        tf.compat.v1.logging.info("***** Run prediction *****")
         tf.compat.v1.logging.info("  Num examples = %d", len(predict_examples))
         tf.compat.v1.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
         
-        predict_record_file = os.path.join(FLAGS.output_dir, "dev-{0}.tfrecord".format(task_name))
-        predict_pickle_file = os.path.join(FLAGS.output_dir, "dev-{0}.pkl".format(task_name))
+        predict_record_file = None
+        predict_pickle_file = None
+        
+        if FLAGS.do_predict_span:
+            predict_record_file = os.path.join(FLAGS.output_dir, "dev-{0}_original_span.tfrecord".format(task_name))
+            predict_pickle_file = os.path.join(FLAGS.output_dir, "dev-{0}_original_span.pkl".format(task_name))
+        elif FLAGS.do_predict_coqa:
+            predict_record_file = os.path.join(FLAGS.output_dir, "dev-{0}_generated_coqa.tfrecord".format(task_name))
+            predict_pickle_file = os.path.join(FLAGS.output_dir, "dev-{0}_generated_coqa.pkl".format(task_name))
+        elif FLAGS.do_predict_quac:
+            predict_record_file = os.path.join(FLAGS.output_dir, "dev-{0}_generated_quac.tfrecord".format(task_name))
+            predict_pickle_file = os.path.join(FLAGS.output_dir, "dev-{0}_generated_quac.pkl".format(task_name))
+        elif FLAGS.do_predict_coqa_train:
+            predict_record_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa.tfrecord".format(task_name))
+            predict_pickle_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_coqa.pkl".format(task_name))
+        elif FLAGS.do_predict_quac_train:
+            predict_record_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_quac.tfrecord".format(task_name))
+            predict_pickle_file = os.path.join(FLAGS.output_dir, "train-{0}_generated_quac.pkl".format(task_name))
+        else:
+            predict_record_file = os.path.join(FLAGS.output_dir, "dev-{0}.tfrecord".format(task_name))
+            predict_pickle_file = os.path.join(FLAGS.output_dir, "dev-{0}.pkl".format(task_name))
         if not os.path.exists(predict_record_file) or not os.path.exists(predict_pickle_file) or FLAGS.overwrite_data:
             predict_features = example_processor.convert_examples_to_features(predict_examples)
             example_processor.save_features_as_tfrecord(predict_features, predict_record_file)
             example_processor.save_features_as_pickle(predict_features, predict_pickle_file)
         else:
             predict_features = example_processor.load_features_from_pickle(predict_pickle_file)
-        
+
         predict_input_fn = XLNetInputBuilder.get_input_fn(predict_record_file, FLAGS.max_seq_length, False, False)
         results = estimator.predict(input_fn=predict_input_fn)
         
         predict_results = [OutputResult(
             unique_id=result["unique_id"],
-            unk_prob=result["unk_prob"],
-            yes_prob=result["yes_prob"],
-            no_prob=result["no_prob"],
-            num_probs=result["num_probs"].tolist(),
-            opt_probs=result["opt_probs"].tolist(),
             start_prob=result["start_prob"].tolist(),
             start_index=result["start_index"].tolist(),
             end_prob=result["end_prob"].tolist(),
             end_index=result["end_index"].tolist()
         ) for result in results]
-        
+
         predict_processor = XLNetPredictProcessor(
             output_dir=FLAGS.output_dir,
             n_best_size=FLAGS.n_best_size,
@@ -1749,7 +1873,7 @@ def main(_):
             predict_tag=FLAGS.predict_tag)
         
         predict_processor.process(predict_examples, predict_features, predict_results)
-    
+        
     if FLAGS.do_export:
         tf.compat.v1.logging.info("***** Running exporting *****")
         if not os.path.exists(FLAGS.export_dir):
@@ -1763,5 +1887,8 @@ if __name__ == "__main__":
     print("Do Train:",FLAGS.do_train)
     print("Do Predict:",FLAGS.do_predict)
     print("Do Export:",FLAGS.do_export)
+    print("Do Original:",FLAGS.train_original)
+    print("Do Generated_CoQA:",FLAGS.train_generated_coqa)
+    print("Do Generated_QuAC:",FLAGS.train_generated_quac)
     print("Do lower case:", FLAGS.lower_case)
     tf.compat.v1.app.run()

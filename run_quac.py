@@ -233,7 +233,12 @@ class QuacPipeline(object):
                               num_turn):
         question_tokens = []
         question_tokens.extend(['<s>'] + qas["question"].split(' '))
-        question_tokens.extend(['</s>'] + qas["orig_answer"]["text"].split(' '))
+        answer_text = qas["orig_answer"]["text"]
+        if qas["yesno"] == "y":
+            answer_text = "yes"
+        if qas["yesno"] == "n":
+            answer_text = "no"
+        question_tokens.extend(['</s>'] + answer_text.split(' '))
         
         question_text = " ".join(question_tokens)
         if question_text:

@@ -1,176 +1,51 @@
-for i in "$@"
-  do
-    case $i in
-      -g=*|--gpudevice=*)
-      GPUDEVICE="${i#*=}"
-      shift
-      ;;
-      -n=*|--numgpus=*)
-      NUMGPUS="${i#*=}"
-      shift
-      ;;
-      -t=*|--taskname=*)
-      TASKNAME="${i#*=}"
-      shift
-      ;;
-      -r=*|--randomseed=*)
-      RANDOMSEED="${i#*=}"
-      shift
-      ;;
-      -p=*|--predicttag=*)
-      PREDICTTAG="${i#*=}"
-      shift
-      ;;
-      -m=*|--modeldir=*)
-      MODELDIR="${i#*=}"
-      shift
-      ;;
-      -d=*|--datadir=*)
-      DATADIR="${i#*=}"
-      shift
-      ;;
-      -o=*|--outputdir=*)
-      OUTPUTDIR="${i#*=}"
-      shift
-      ;;
-      --numturn=*)
-      NUMTURN="${i#*=}"
-      shift
-      ;;
-      --seqlen=*)
-      SEQLEN="${i#*=}"
-      shift
-      ;;
-      --querylen=*)
-      QUERYLEN="${i#*=}"
-      shift
-      ;;
-      --answerlen=*)
-      ANSWERLEN="${i#*=}"
-      shift
-      ;;
-      --batchsize=*)
-      BATCHSIZE="${i#*=}"
-      shift
-      ;;
-      --learningrate=*)
-      LEARNINGRATE="${i#*=}"
-      shift
-      ;;
-      --trainsteps=*)
-      TRAINSTEPS="${i#*=}"
-      shift
-      ;;
-      --warmupsteps=*)
-      WARMUPSTEPS="${i#*=}"
-      shift
-      ;;
-      --savesteps=*)
-      SAVESTEPS="${i#*=}"
-      shift
-      ;;
-      --answerthreshold=*)
-      ANSWERTHRESHOLD="${i#*=}"
-      shift
-      ;;
-    esac
-  done
+#!/bin/bash -l
 
-echo "gpu device        = ${GPUDEVICE}"
-echo "num gpus          = ${NUMGPUS}"
-echo "task name         = ${TASKNAME}"
-echo "random seed       = ${RANDOMSEED}"
-echo "predict tag       = ${PREDICTTAG}"
-echo "model dir         = ${MODELDIR}"
-echo "data dir          = ${DATADIR}"
-echo "output dir        = ${OUTPUTDIR}"
-echo "num turn          = ${NUMTURN}"
-echo "seq len           = ${SEQLEN}"
-echo "query len         = ${QUERYLEN}"
-echo "answer len        = ${ANSWERLEN}"
-echo "batch size        = ${BATCHSIZE}"
-echo "learning rate     = ${LEARNINGRATE}"
-echo "train steps       = ${TRAINSTEPS}"
-echo "warmup steps      = ${WARMUPSTEPS}"
-echo "save steps        = ${SAVESTEPS}"
-echo "answer threshold  = ${ANSWERTHRESHOLD}"
+#SBATCH -J  coqa-base       # --job-name=singularity
+#SBATCH -o  coqa-base.%j.out   # slurm output file (%j:expands to %jobId)
+#SBATCH -p  A100-80GB             # queue or partiton name ; sinfo  output
+#SBATCH --gres=gpu:1          # gpu Num Devices  가급적이면  1,2,4.6,8  2배수로 합니다.
+GPU_NUM=4
+TAG=base
 
-alias python=python3
-mkdir ${OUTPUTDIR}
+echo $GPU_NUM
 
-start_time=`date +%s`
+export SINGULARITYENV_CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
 
-CUDA_VISIBLE_DEVICES=${GPUDEVICE} python run_coqa.py \
---spiece_model_file=${MODELDIR}/spiece.model \
---model_config_path=${MODELDIR}/xlnet_config.json \
---init_checkpoint=${MODELDIR}/xlnet_model.ckpt \
---task_name=${TASKNAME} \
---random_seed=${RANDOMSEED} \
---predict_tag=${PREDICTTAG} \
---lower_case=false \
---data_dir=${DATADIR}/ \
---output_dir=${OUTPUTDIR}/data \
---model_dir=${OUTPUTDIR}/checkpoint \
---export_dir=${OUTPUTDIR}/export \
---num_turn=${NUMTURN} \
---max_seq_length=${SEQLEN} \
---max_query_length=${QUERYLEN} \
---max_answer_length=${ANSWERLEN} \
---train_batch_size=${BATCHSIZE} \
---predict_batch_size=${BATCHSIZE} \
---num_hosts=1 \
---num_core_per_host=${NUMGPUS} \
---learning_rate=${LEARNINGRATE} \
---train_steps=${TRAINSTEPS} \
---warmup_steps=${WARMUPSTEPS} \
---save_steps=${SAVESTEPS} \
---do_train=true \
---do_predict=false \
---do_export=false \
---overwrite_data=false
+module purge
+module load singularity
 
-CUDA_VISIBLE_DEVICES=${GPUDEVICE} python run_coqa.py \
---spiece_model_file=${MODELDIR}/spiece.model \
---model_config_path=${MODELDIR}/xlnet_config.json \
---init_checkpoint=${MODELDIR}/xlnet_model.ckpt \
---task_name=${TASKNAME} \
---random_seed=${RANDOMSEED} \
---predict_tag=${PREDICTTAG} \
---lower_case=false \
---data_dir=${DATADIR}/ \
---output_dir=${OUTPUTDIR}/data \
---model_dir=${OUTPUTDIR}/checkpoint \
---export_dir=${OUTPUTDIR}/export \
---num_turn=${NUMTURN} \
---max_seq_length=${SEQLEN} \
---max_query_length=${QUERYLEN} \
---max_answer_length=${ANSWERLEN} \
---train_batch_size=${BATCHSIZE} \
---predict_batch_size=${BATCHSIZE} \
---num_hosts=1 \
---num_core_per_host=1 \
---learning_rate=${LEARNINGRATE} \
---train_steps=${TRAINSTEPS} \
---warmup_steps=${WARMUPSTEPS} \
---save_steps=${SAVESTEPS} \
---do_train=false \
---do_predict=true \
---do_export=false \
---overwrite_data=false
+OUTPUT_DIR=output/coqa/data
+MODEL_DIR=output/coqa/$TAG
 
+mkdir $OUTPUT_DIR
+mkdir $MODEL_DIR
+#singularity exec --nv ./xln_24_latest.sif python run_coqa.py \
+#    --spiece-model-file=model/cased_large/spiece.model \
+#    --model-config-path=model/cased_large/xlnet_config.json \
+#    --init-checkpoint=model/cased_large/xlnet_model.ckpt \
+#    --task-name=coqa \
+#    --random-seed=2020 \
+#    --predict-tag=$TAG \
+#    --data-dir=data/coqa \
+#    --output-dir=$OUTPUT_DIR \
+#    --model-dir=$MODEL_DIR \
+#    --export-dir=output/coqa/export \
+#    --max-seq-length=512 \
+#    --max-query-length=128 \
+#    --train-batch-size=12 \
+#    --num-hosts=1 \
+#    --num-core-per-host=$GPU_NUM \
+#    --learning-rate=3e-5 \
+#    --train-steps=6000 \
+#    --save-steps=3000 \
+#    --do-train \
+#    --do-predict
+    
 python tool/convert_coqa.py \
---input_file=${OUTPUTDIR}/data/predict.${PREDICTTAG}.summary.json \
---output_file=${OUTPUTDIR}/data/predict.${PREDICTTAG}.span.json \
---answer_threshold=${ANSWERTHRESHOLD}
-
-rm ${OUTPUTDIR}/data/predict.${PREDICTTAG}.eval.json
+--input_file=$OUTPUT_DIR/predict.$TAG.summary.json \
+--output_file=$OUTPUT_DIR/predict.$TAG.span.json
 
 python tool/eval_coqa.py \
---data-file=${DATADIR}/dev-${TASKNAME}.json \
---pred-file=${OUTPUTDIR}/data/predict.${PREDICTTAG}.span.json \
->> ${OUTPUTDIR}/data/predict.${PREDICTTAG}.eval.json
-
-end_time=`date +%s`
-echo execution time was `expr $end_time - $start_time` s.
-
-read -n 1 -s -r -p "Press any key to continue..."
+--data-file=data/coqa/dev-coqa.json \
+--pred-file=$OUTPUT_DIR/predict.$TAG.span.json \
+> $OUTPUT_DIR/predict.$TAG.eval.json
