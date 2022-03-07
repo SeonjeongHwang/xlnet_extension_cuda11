@@ -1,7 +1,5 @@
 # XLNet Extension
 
-for cuda11
-
 **\*\*\*\*\* Top 3 single model on [CoQA](https://stanfordnlp.github.io/coqa/) leaderboard as of Sep 13th, 2019\*\*\*\*\***
 
 **\*\*\*\*\* Top 3 single model on [QuAC](https://quac.ai/) leaderboard as of Nov 1st, 2019\*\*\*\*\***
@@ -12,7 +10,8 @@ for cuda11
 
 ## Setting
 * Python 3.6.7
-* Tensorflow 1.13.1
+* CUDA 11
+* Tensorflow 2.4
 * NumPy 1.13.3
 * SentencePiece 0.1.82
 
